@@ -7,7 +7,9 @@ from __future__ import print_function
 from copy import deepcopy
 import os
 from itertools import chain
+from optparse import make_option
 import pprint
+import subprocess
 from StringIO import StringIO
 
 from two2three.pgen2 import driver
@@ -22,6 +24,12 @@ from south_rebase.diff import ModelsDiff
 
 
 class Command(BaseCommand):
+    option_list = BaseCommand.option_list + (
+        make_option('--git', action='store_const', dest='plan_generator',
+                    const='git', default='interactive',
+                    help='Rebase all migrations from last commit'),
+    )
+
     def handle(self, app_name=None, **options):
         self.options = options
 
@@ -100,7 +108,9 @@ class Command(BaseCommand):
 
     def split_migrations(self, all_migrations):
         """Pick splitting algorithm and return rebase_plan"""
-        return self.interactive_split_migrations(all_migrations)
+        generators = dict(interactive=self.interactive_split_migrations,
+                          git=self.git_split_migrations)
+        return generators[self.options['plan_generator']](all_migrations)
 
     def interactive_split_migrations(self, all_migrations):
         """Prepare rebase_plan by asking user about conflicting migrations"""
@@ -139,6 +149,54 @@ class Command(BaseCommand):
             last_num_migrations.discard(
                 rebase_plan.migrations[-1]['migration'])
         rebase_plan.onto = only_element(last_num_migrations)
+
+        return rebase_plan
+
+    def git_split_migrations(self, all_migrations):
+        """return plan for rebasing all migrations from last commit"""
+        repo_path = os.path.abspath(git_cdup())
+        new_migration_paths = set()
+
+        normalize = lambda p: os.path.realpath(p)
+
+        for added, deleted, path in git_diff_tree():
+            if added and '/migrations/' in path:
+                if not deleted:
+                    new_migration_paths.add(normalize(
+                        os.path.join(repo_path, path)))
+                else:
+                    print(u'WARNING: Not using migration "%s" because '
+                          u'it is modified and not new' % path)
+
+        # Pick which migrations to rebase
+        to_rebase = []
+        other_migrations = []
+        for migration in all_migrations:
+            normalized = normalize(self.find_migration_path(migration))
+            if normalized in new_migration_paths:
+                to_rebase.append(migration)
+            else:
+                other_migrations.append(migration)
+
+        first_num = min(migration_number(m) for m in to_rebase)
+
+        others_last_num = max(migration_number(m)
+                              for m in other_migrations)
+
+        prev_num = first_num - 1
+        last_common_migration = only_element(
+            m for m in other_migrations if migration_number(m) == prev_num)
+
+        rebase_plan = RebasePlan()
+        for prev, migration in zip(chain([last_common_migration], to_rebase),
+                                   to_rebase):
+            rebase_plan.migrations.append({
+                'previous': prev,
+                'migration': migration,
+            })
+        rebase_plan.onto = only_element(
+            m for m in other_migrations
+            if migration_number(m) == others_last_num)
 
         return rebase_plan
 
@@ -187,7 +245,7 @@ class RebasePlan(object):
     """Object representing a plan for rebasing."""
     def __init__(self):
         self.onto = None  # What is the new base migration?
-        self.migrations = None
+        self.migrations = []
         """List of dicts of migrations to rebase (in target order). Used keys:
             - migration - the migration that needs rebasing
             - previous - a migration this one was based on.
@@ -197,6 +255,10 @@ class RebasePlan(object):
 def split_migration_name(name):
     num, base = name.split('_', 1)
     return int(num), base
+
+
+def migration_number(migration):
+    return split_migration_name(migration.name())[0]
 
 
 def iterate_tree(tree):
@@ -272,3 +334,20 @@ def pprint_str(obj, **kwargs):
     stream = StringIO()
     pprint.pprint(obj, stream=stream, **kwargs)
     return stream.getvalue()
+
+
+def git_diff_tree(treeish='HEAD', other_treeish=None):
+    """Does git diff-tree and yields tuples of (added, deleted, file_path)"""
+    args = 'git diff-tree --numstat -r -z'.split() + [treeish]
+    if other_treeish is not None:
+        args.append(other_treeish)
+    raw_output = subprocess.check_output(args)
+    # Drop the first line - it's the commit hash
+    lines = raw_output.split(chr(0))[1:]
+    for line in filter(None, lines):
+        added, deleted, path = tuple(line.split('\t'))
+        yield (int(added), int(deleted), path.decode('utf-8'))
+
+def git_cdup():
+    """Return path to root of git project"""
+    return subprocess.check_output('git rev-parse --show-cdup'.split()).strip()
