@@ -8,6 +8,7 @@ from copy import deepcopy
 import os
 from itertools import chain
 import pprint
+from StringIO import StringIO
 
 from two2three.pgen2 import driver
 from two2three import pygram, pytree
@@ -132,7 +133,7 @@ class Command(BaseCommand):
             find_classes(tree, name='Migration').next(),
             name='models').next()
         new_models_assignment_tree = self.driver.parse_string(
-            'models = %s\n' % pprint.pprint(new_models, indent=4))
+            'models = %s\n' % pprint_str(new_models))
         new_models_assignment = find_assignments(
             new_models_assignment_tree).next()
         model_dict_assignment.children[2] = new_models_assignment.children[2]
@@ -281,3 +282,10 @@ def find_assignments(tree, name=None):
                 (name is None or name == node.children[0].value) and \
                 node.children[1].value == '=':
             yield node
+
+
+def pprint_str(obj, **kwargs):
+    assert 'stream' not in kwargs
+    stream = StringIO()
+    pprint.pprint(obj, stream=stream, **kwargs)
+    return stream.getvalue()

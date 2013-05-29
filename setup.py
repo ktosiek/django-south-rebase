@@ -12,7 +12,7 @@ setup(
     packages=['south_rebase'],
     include_package_data=True,
     license='GPL License',
-    description='Simple app for rebasing sout migrations',
+    description='Simple app for rebasing south migrations',
     long_description=README,
     url='https://github.com/roverorna/django-south-rebase',
     author='Tomasz Kontusz',
