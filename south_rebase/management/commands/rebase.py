@@ -23,44 +23,69 @@ from south_rebase.diff import ModelsDiff
 
 class Command(BaseCommand):
     def handle(self, app_name=None, **options):
-        files_to_remove = []
-        files_to_write = {}  # (filename, content)
+        self.options = options
+
+        if app_name is None:
+            print('No app_label given')
+            return
 
         migrations = Migrations(app_name)
-        last_common, other_branch = self.split_migrations(migrations)
-        if not other_branch:
+        rebase_plan = self.split_migrations(migrations)
+        if not rebase_plan.migrations:
             print('No migrations to rebase')
             return
 
         diffs = []
-        for prev_migration, migration in zip(
-                [last_common] + other_branch, other_branch):
+        for plan_elem in rebase_plan.migrations:
             """Prepare diffs"""
-            diffs.append(self.diff_frozen_models(prev_migration, migration))
+            diffs.append(self.diff_frozen_models(plan_elem['previous'],
+                                                 plan_elem['migration']))
 
-        for diff, prev_migration, migration in zip(
-                diffs, [migrations[-1]] + other_branch, other_branch):
+        prev_migration = rebase_plan.onto
+        self.prepare_file_cache()
+        for diff, migration in zip(
+                diffs, (m['migration'] for m in rebase_plan.migrations)):
             """Rebase - rename migrations and apply diffs"""
-            last_migration_no, _ = split_migration_name(migrations[-1].name())
+            # Prepare new name for migration
+            last_migration_no, _ = split_migration_name(prev_migration.name())
             _, migration_base_name = split_migration_name(migration.name())
 
             migration_path = self.find_migration_path(migration)
             migration_dir = os.path.dirname(migration_path)
 
-            new_migration_tree = self.get_updated_migration(
-                migration, prev_migration, diff=diff)
             new_migration_filename = '%04i_%s.py' % (last_migration_no + 1,
                                                      migration_base_name)
             new_migration_path = os.path.join(
                 migration_dir, new_migration_filename)
-            files_to_write[new_migration_path] = unicode(new_migration_tree)
-            files_to_remove.append(migration_path)
 
-        if all(map(os.path.exists, files_to_remove)) and \
-                not any(map(os.path.exists, files_to_write)):
-            for path in files_to_remove:
+            # patch migration tree
+            new_migration_tree = self.get_updated_migration(
+                migration, prev_migration, diff=diff)
+
+            self.write_file(new_migration_path,
+                            unicode(new_migration_tree).encode('utf-8'))
+            self.remove_file(migration_path)
+
+            prev_migration = migration
+
+        self.flush_file_cache()
+
+    def write_file(self, path, content):
+        self.files_to_write[path] = content
+
+    def remove_file(self, path):
+        self.files_to_remove.append(path)
+
+    def prepare_file_cache(self):
+        self.files_to_remove = []
+        self.files_to_write = {}  # (filename, content)
+
+    def flush_file_cache(self):
+        if all(map(os.path.exists, self.files_to_remove)) and \
+                not any(map(os.path.exists, self.files_to_write)):
+            for path in self.files_to_remove:
                 os.remove(path)
-            for path, data in files_to_write.items():
+            for path, data in self.files_to_write.items():
                 if not isinstance(data, str):
                     data = data.encode('utf-8')
                 with open(path, 'w') as f:
@@ -73,32 +98,49 @@ class Command(BaseCommand):
             path = path[:-1]
         return path
 
-    def split_migrations(self, migrations):
-        """Split migrations that need rebase out of the migrations list"""
+    def split_migrations(self, all_migrations):
+        """Pick splitting algorithm and return rebase_plan"""
+        return self.interactive_split_migrations(all_migrations)
+
+    def interactive_split_migrations(self, all_migrations):
+        """Prepare rebase_plan by asking user about conflicting migrations"""
+        rebase_plan = RebasePlan()
+
         known_migrations_by_number = {}
-        for m in migrations:
+        for m in all_migrations:
             num, base_name = split_migration_name(m.name())
             known_migrations_by_number.setdefault(num, [])
             known_migrations_by_number[num].append(m)
 
-        other_migrations = []
-        last_common = None
+        rebase_plan.migrations = []
         for num, num_migrations in known_migrations_by_number.items():
+            """For every migration number, ask about conflicts"""
             if len(num_migrations) > 1:
-                print('Colliding migration names:')
-                for i, m in enumerate(num_migrations):
-                    print('% 4i: %s' % (i, m.name()))
-                print('pick the one to rebase')
-                rebase_i = int(raw_input())
-                other_migrations.append(num_migrations[rebase_i])
-                del num_migrations[rebase_i]
-                if last_common is None:
-                    last_common = known_migrations_by_number[num - 1][0]
+                selected_migration = interactive_select(
+                    [(m.name(), m) for m in num_migrations],
+                    'Colliding migration names:',
+                    'pick the one to rebase')
 
-        for m in other_migrations:
-            migrations.remove(m)
+                last_num_migrations = set(known_migrations_by_number[num - 1])
+                """last_num_migrations are migrations for previous number,
+                minus the one that is already selected for rebasing"""
+                if rebase_plan.migrations:
+                    last_num_migrations.discard(
+                        rebase_plan.migrations[-1]['migration'])
 
-        return last_common, other_migrations
+                prev = only_element(last_num_migrations)
+                rebase_plan.migrations.append({
+                    'migration': selected_migration,
+                    'previous': prev,
+                })
+
+        last_num_migrations = set(num_migrations)
+        if rebase_plan.migrations:
+            last_num_migrations.discard(
+                rebase_plan.migrations[-1]['migration'])
+        rebase_plan.onto = only_element(last_num_migrations)
+
+        return rebase_plan
 
     def diff_frozen_models(self, prev_migration, migration):
         """Return differences between frozen models"""
@@ -141,10 +183,20 @@ class Command(BaseCommand):
         model_dict_assignment.children[2] = new_models_assignment.children[2]
 
 
+class RebasePlan(object):
+    """Object representing a plan for rebasing."""
+    def __init__(self):
+        self.onto = None  # What is the new base migration?
+        self.migrations = None
+        """List of dicts of migrations to rebase (in target order). Used keys:
+            - migration - the migration that needs rebasing
+            - previous - a migration this one was based on.
+        """
+
+
 def split_migration_name(name):
     num, base = name.split('_', 1)
     return int(num), base
-
 
 
 def iterate_tree(tree):
@@ -168,6 +220,51 @@ def find_assignments(tree, name=None):
                 (name is None or name == node.children[0].value) and \
                 node.children[1].value == '=':
             yield node
+
+
+def interactive_select(options, pre_message=None, post_message=None):
+    """Select one of options interactively"""
+    if len(options) == 0:
+        return
+    if not isinstance(options[0], tuple):
+        options = [(unicode(o), o) for o in options]
+    if len(options) == 1:
+        return options[0][1]
+
+    def print_options():
+        if pre_message is not None:
+            print(pre_message)
+
+        for i, (opt_name, opt_value) in enumerate(options):
+            print('% 4i: %s' % (i, opt_name))
+
+        if post_message is not None:
+            print(post_message)
+
+    option_index = -1
+
+    while not 0 <= option_index < len(options):
+        try:
+            print_options()
+            option_index = int(raw_input())
+        except ValueError:
+            pass
+
+    return options[option_index][1]
+
+
+def only_element(collection):
+    """Return the only element of collection, or throw if it has more"""
+    coll_iter = iter(collection)
+    try:
+        elem = coll_iter.next()
+    except StopIteration:
+        raise ValueError('Empty collection')
+    try:
+        coll_iter.next()
+        raise ValueError('Collection has more elements')
+    except StopIteration:
+        return elem
 
 
 def pprint_str(obj, **kwargs):
